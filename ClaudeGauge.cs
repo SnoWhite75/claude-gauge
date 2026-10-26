@@ -53,6 +53,7 @@ namespace ClaudeGaugeApp
         public string ApiKeyEnc = "";
         public string UpdateUrl = "https://raw.githubusercontent.com/SnoWhite75/claude-gauge/main/";
         public bool AutoUpdate = true;
+        public bool AutoRenew = true;
         public int FailedVersion = 0;
 
         static string FilePath()
@@ -90,6 +91,7 @@ namespace ClaudeGaugeApp
                             case "apikey": s.ApiKeyEnc = v; break;
                             case "updateurl": if (v.Length > 0) s.UpdateUrl = v; break;
                             case "autoupdate": s.AutoUpdate = v == "1"; break;
+                            case "autorenew": s.AutoRenew = v == "1"; break;
                             case "failedver": int.TryParse(v, out s.FailedVersion); break;
                         }
                     }
@@ -122,6 +124,7 @@ namespace ClaudeGaugeApp
                 l.Add("apikey=" + ApiKeyEnc);
                 l.Add("updateurl=" + UpdateUrl);
                 l.Add("autoupdate=" + (AutoUpdate ? "1" : "0"));
+                l.Add("autorenew=" + (AutoRenew ? "1" : "0"));
                 l.Add("failedver=" + FailedVersion);
                 File.WriteAllLines(p, l.ToArray(), Encoding.UTF8);
             }
@@ -138,6 +141,7 @@ namespace ClaudeGaugeApp
         public DateTime FiveReset = DateTime.MinValue, WeekReset = DateTime.MinValue;
         public string Plan = "";
         public bool Backoff;
+        public bool Expired;
     }
 
     class ApiResult
@@ -359,8 +363,9 @@ namespace ClaudeGaugeApp
                     double nowMs = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
                     if (exp > 0 && nowMs >= exp)
                     {
-                        SubResult e = Fail("로그인 토큰이 만료됐어요. Claude Code를 한 번 실행하면 갱신돼요");
+                        SubResult e = Fail("로그인 토큰이 만료됐어요. 메뉴의 '로그인 갱신'을 눌러 주세요");
                         e.Plan = plan;
+                        e.Expired = true;
                         return e;
                     }
                 }
@@ -393,7 +398,7 @@ namespace ClaudeGaugeApp
                 }
             }
             SubResult f;
-            if (r.Status == 401) f = Fail("로그인이 만료됐어요. Claude Code를 실행해 주세요");
+            if (r.Status == 401) { f = Fail("로그인이 만료됐어요. 메뉴의 '로그인 갱신'을 눌러 주세요"); f.Expired = true; }
             else if (r.Status == 403) f = Fail("권한이 부족해요. 터미널에서 claude auth login 으로 다시 로그인해 주세요");
             else if (r.Status == 429) { f = Fail("요청이 많아 잠시 쉬는 중이에요"); f.Backoff = true; }
             else f = Fail("서버 응답 오류 (" + r.Status + ")");
@@ -444,10 +449,83 @@ namespace ClaudeGaugeApp
         }
     }
 
+    // ------------------------------------------------------------------ token renew (runs the official claude once)
+    static class TokenRefresher
+    {
+        public static string FindClaude()
+        {
+            string up = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string c1 = Path.Combine(up, @".local\bin\claude.exe");
+            if (File.Exists(c1)) return c1;
+            string path = Environment.GetEnvironmentVariable("PATH");
+            if (!string.IsNullOrEmpty(path))
+            {
+                foreach (string dir in path.Split(';'))
+                {
+                    string d = dir.Trim();
+                    if (d.Length == 0) continue;
+                    try
+                    {
+                        string a = Path.Combine(d, "claude.exe");
+                        if (File.Exists(a)) return a;
+                        string b = Path.Combine(d, "claude.cmd");
+                        if (File.Exists(b)) return b;
+                    }
+                    catch { }
+                }
+            }
+            return null;
+        }
+
+        static int RunOnce(string claude, string args)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo();
+                bool viaCmd = claude.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) || claude.EndsWith(".bat", StringComparison.OrdinalIgnoreCase);
+                if (viaCmd) { psi.FileName = "cmd.exe"; psi.Arguments = "/s /c \"\"" + claude + "\" " + args + "\""; }
+                else { psi.FileName = claude; psi.Arguments = args; }
+                psi.WorkingDirectory = Path.GetTempPath();
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardInput = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (Process p = Process.Start(psi))
+                {
+                    p.OutputDataReceived += delegate(object so, DataReceivedEventArgs ev) { };
+                    p.ErrorDataReceived += delegate(object so, DataReceivedEventArgs ev) { };
+                    p.BeginOutputReadLine();
+                    p.BeginErrorReadLine();
+                    try { p.StandardInput.Close(); } catch { }
+                    if (!p.WaitForExit(90000))
+                    {
+                        try { p.Kill(); } catch { }
+                        return -1;
+                    }
+                    return p.ExitCode;
+                }
+            }
+            catch { return -2; }
+        }
+
+        // 아주 짧은 요청을 한 번 보내면 Claude Code가 스스로 로그인 토큰을 갱신해요.
+        public static bool Run(out string msg)
+        {
+            msg = "";
+            string claude = FindClaude();
+            if (claude == null) { msg = "claude 프로그램을 찾지 못했어요. Claude Code가 설치돼 있는지 확인해 주세요"; return false; }
+            if (RunOnce(claude, "-p \".\" --model haiku") == 0) return true;
+            if (RunOnce(claude, "-p \".\"") == 0) return true;
+            msg = "갱신하지 못했어요. 터미널에서 claude 를 실행해 다시 로그인해 주세요";
+            return false;
+        }
+    }
+
     // ------------------------------------------------------------------ app info / paths
     static class AppInfo
     {
-        public const int AppVersion = 4;
+        public const int AppVersion = 5;
 
         public static string DataDir()
         {
@@ -636,7 +714,9 @@ namespace ClaudeGaugeApp
         bool updBusy, oldCleaned;
         DateTime nextUpd = DateTime.UtcNow.AddSeconds(30);
         string lastLog;
-        ToolStripMenuItem miAutoUpd;
+        ToolStripMenuItem miAutoUpd, miAutoRenew;
+        bool renewBusy;
+        DateTime lastAutoRenew = DateTime.MinValue;
 
         // ui
         NotifyIcon notify;
@@ -879,6 +959,9 @@ namespace ClaudeGaugeApp
         {
             menu = new ContextMenuStrip();
             menu.Items.Add(MI("지금 새로고침  (Ctrl+Alt+R)", delegate { RefreshNow(); }));
+            menu.Items.Add(MI("로그인 갱신  (Claude Code를 한 번 실행)", delegate { StartTokenRefresh(true); }));
+            miAutoRenew = MI("만료되면 자동으로 갱신", delegate { st.AutoRenew = !st.AutoRenew; st.Save(); });
+            menu.Items.Add(miAutoRenew);
             menu.Items.Add(new ToolStripSeparator());
 
             ToolStripMenuItem show = new ToolStripMenuItem("표시 항목");
@@ -981,6 +1064,7 @@ namespace ClaudeGaugeApp
                 miClick.Checked = clickThrough;
                 miAuto.Checked = GetAutoStart();
                 miAutoUpd.Checked = st.AutoUpdate;
+                miAutoRenew.Checked = st.AutoRenew;
                 miHide.Text = Visible ? "숨기기  (Ctrl+Alt+G)" : "보이기  (Ctrl+Alt+G)";
                 foreach (KeyValuePair<ToolStripMenuItem, double> kv in sizeItems) kv.Key.Checked = Math.Abs(kv.Value - st.Scale) < 0.02;
                 foreach (KeyValuePair<ToolStripMenuItem, double> kv in opacItems) kv.Key.Checked = (int)kv.Value == st.OpacityPct;
@@ -1247,6 +1331,36 @@ namespace ClaudeGaugeApp
             Invalidate();
         }
 
+        void StartTokenRefresh(bool manual)
+        {
+            if (renewBusy) return;
+            renewBusy = true;
+            lastAutoRenew = DateTime.UtcNow;
+            subMsg = "로그인 갱신 중... (최대 1분)";
+            Invalidate();
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string msg;
+                bool ok = TokenRefresher.Run(out msg);
+                Post(delegate
+                {
+                    renewBusy = false;
+                    if (ok)
+                    {
+                        subMsg = "";
+                        if (manual) Notify("로그인 갱신 완료", "게이지를 새로고침해요", null);
+                        RefreshNow();
+                    }
+                    else
+                    {
+                        subMsg = msg;
+                        Notify("로그인 갱신 실패", msg, null);
+                    }
+                    Invalidate();
+                });
+            });
+        }
+
         void StartSub()
         {
             subBusy = true;
@@ -1293,8 +1407,10 @@ namespace ClaudeGaugeApp
             else
             {
                 subStale = subHave;
-                subMsg = r.Msg;
+                subMsg = renewBusy ? "로그인 갱신 중... (최대 1분)" : r.Msg;
                 if (r.Backoff) nextSub = DateTime.UtcNow.AddSeconds(300);
+                if (r.Expired && st.AutoRenew && !renewBusy && (DateTime.UtcNow - lastAutoRenew).TotalMinutes > 30)
+                    StartTokenRefresh(false);
             }
             Invalidate();
         }
