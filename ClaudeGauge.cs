@@ -453,7 +453,7 @@ namespace ClaudeGaugeApp
     // ------------------------------------------------------------------ app info / paths
     static class AppInfo
     {
-        public const int AppVersion = 2;
+        public const int AppVersion = 3;
 
         public static string DataDir()
         {
@@ -951,12 +951,53 @@ namespace ClaudeGaugeApp
             return pi;
         }
 
+        public static string Diag = "";
+
+        // Claude Code가 세션별로 따로 저장하는 작업 목록(~/.claude/tasks/<세션ID>/*.json)
+        static List<TaskItem> ReadTaskDir(string sessionId)
+        {
+            try
+            {
+                string dir = Path.Combine(Path.Combine(Fetcher.ConfigDir(), "tasks"), sessionId);
+                if (!Directory.Exists(dir)) return null;
+                string[] files = Directory.GetFiles(dir, "*.json");
+                if (files.Length == 0) return null;
+                List<KeyValuePair<int, TaskItem>> tmp = new List<KeyValuePair<int, TaskItem>>();
+                foreach (string f in files)
+                {
+                    try
+                    {
+                        Dictionary<string, object> d = MiniJson.Parse(File.ReadAllText(f, Encoding.UTF8)) as Dictionary<string, object>;
+                        if (d == null) continue;
+                        string status = Str(d, "status");
+                        if (status == "completed" || status == "deleted") continue;
+                        string text = TaskStore.Clean(Str(d, "subject"));
+                        if (text.Length == 0) text = TaskStore.Clean(Str(d, "content"));
+                        if (text.Length == 0) continue;
+                        TaskItem ti = new TaskItem();
+                        ti.Text = text;
+                        ti.Status = status.Length > 0 ? status : "pending";
+                        int num;
+                        if (!int.TryParse(Path.GetFileNameWithoutExtension(f), out num)) num = 9999;
+                        tmp.Add(new KeyValuePair<int, TaskItem>(num, ti));
+                    }
+                    catch { }
+                }
+                tmp.Sort(delegate(KeyValuePair<int, TaskItem> a, KeyValuePair<int, TaskItem> b) { return a.Key.CompareTo(b.Key); });
+                List<TaskItem> res = new List<TaskItem>();
+                foreach (KeyValuePair<int, TaskItem> kv in tmp) res.Add(kv.Value);
+                return res;
+            }
+            catch { return null; }
+        }
+
         public static List<ProjectInfo> Scan()
         {
             lock (gate)
             {
                 List<FileInfo> files = new List<FileInfo>();
                 string root = Path.Combine(Fetcher.ConfigDir(), "projects");
+                Diag = Directory.Exists(root) ? "" : "세션 폴더가 없어요: " + root;
                 if (Directory.Exists(root))
                 {
                     foreach (string dir in Directory.GetDirectories(root))
@@ -990,7 +1031,8 @@ namespace ClaudeGaugeApp
                     si.Id = pf.Id;
                     si.Title = pf.Title;
                     si.Time = pf.Time;
-                    foreach (TaskItem t in pf.Items)
+                    List<TaskItem> live = ReadTaskDir(pf.Id);
+                    foreach (TaskItem t in (live != null ? live : pf.Items))
                     {
                         TaskItem c = new TaskItem();
                         c.Text = t.Text;
@@ -998,7 +1040,6 @@ namespace ClaudeGaugeApp
                         c.SessionId = pf.Id;
                         if (!TaskStore.Dismissed.ContainsKey(c.Key())) si.Tasks.Add(c);
                     }
-                    if (si.Tasks.Count == 0) continue;
                     ProjectInfo pi;
                     if (!map.TryGetValue(pf.Cwd, out pi))
                     {
@@ -1252,6 +1293,33 @@ namespace ClaudeGaugeApp
             };
             cmbMode.SelectedIndexChanged += delegate { ChangeMode(); };
             UpdateButtons();
+
+            // 클로드 세션과 자동 동기화: 열려 있는 동안 10초마다 확인, 바뀐 게 있을 때만 갱신
+            syncTimer = new System.Windows.Forms.Timer();
+            syncTimer.Interval = 10000;
+            syncTimer.Tick += delegate { if (Visible && !busy) Reload(true); };
+            syncTimer.Start();
+            FormClosed += delegate { syncTimer.Stop(); syncTimer.Dispose(); };
+        }
+
+        System.Windows.Forms.Timer syncTimer;
+        bool busy = false;
+        string lastSig = null;
+
+        static string Signature(List<ProjectInfo> list)
+        {
+            StringBuilder sb = new StringBuilder();
+            foreach (ProjectInfo p in list)
+            {
+                sb.Append(p.Dir).Append('|');
+                foreach (SessionInfo s in p.Sessions)
+                {
+                    sb.Append(s.Id).Append(':').Append(s.Title).Append(':').Append(s.Time.Ticks).Append(';');
+                    foreach (TaskItem t in s.Tasks) sb.Append(t.Status).Append(t.Text).Append(',');
+                }
+                foreach (TaskItem t in p.Manual) sb.Append('M').Append(t.Text).Append(',');
+            }
+            return sb.ToString();
         }
 
         TaskRef Selected()
@@ -1275,9 +1343,13 @@ namespace ClaudeGaugeApp
             return (int)d.TotalDays + "일 전";
         }
 
-        public void Reload()
+        public void Reload() { Reload(false); }
+
+        public void Reload(bool auto)
         {
-            lblStatus.Text = "세션 기록을 읽는 중...";
+            if (busy && auto) return;
+            busy = true;
+            if (!auto) lblStatus.Text = "세션 기록을 읽는 중...";
             ThreadPool.QueueUserWorkItem(delegate
             {
                 List<ProjectInfo> res = null;
@@ -1288,7 +1360,11 @@ namespace ClaudeGaugeApp
                 {
                     BeginInvoke(new Action(delegate
                     {
-                        if (err != null) { lblStatus.Text = "읽지 못했어요: " + err; return; }
+                        busy = false;
+                        if (err != null) { if (!auto) lblStatus.Text = "읽지 못했어요: " + err; return; }
+                        string sig = Signature(res);
+                        if (auto && sig == lastSig) return;
+                        lastSig = sig;
                         data = res;
                         Rebuild();
                     }));
@@ -1301,14 +1377,14 @@ namespace ClaudeGaugeApp
         {
             tree.BeginUpdate();
             tree.Nodes.Clear();
-            int projects = 0, total = 0;
+            int projects = 0, total = 0, sessionsShown = 0;
             foreach (ProjectInfo p in data)
             {
                 int n = p.Count();
-                if (n == 0) continue;
                 projects++;
                 total += n;
-                TreeNode pn = new TreeNode(p.Name + "   · " + n + "개");
+                sessionsShown += p.Sessions.Count;
+                TreeNode pn = new TreeNode(p.Name + "   · " + (n > 0 ? n + "개 남음" : "남은 할 일 없음"));
                 pn.Tag = p;
                 pn.ToolTipText = p.Dir;
                 pn.ForeColor = Rgb(224, 122, 84);
@@ -1319,6 +1395,11 @@ namespace ClaudeGaugeApp
                     sn.ToolTipText = s.Title;
                     sn.ForeColor = Rgb(150, 172, 190);
                     foreach (TaskItem t in s.Tasks) sn.Nodes.Add(MakeTaskNode(t, p));
+                    if (s.Tasks.Count == 0)
+                    {
+                        sn.Text = s.Title + "   (" + Ago(s.Time) + ")  · 남은 할 일 없음";
+                        sn.ForeColor = Rgb(110, 124, 136);
+                    }
                     pn.Nodes.Add(sn);
                 }
                 if (p.Manual.Count > 0)
@@ -1334,10 +1415,11 @@ namespace ClaudeGaugeApp
             if (tree.Nodes.Count > 0) tree.Nodes[0].EnsureVisible();
             tree.EndUpdate();
             UpdateButtons();
-            if (total == 0)
-                lblStatus.Text = "남은 할 일이 없어요. '할 일 추가'로 직접 넣을 수 있어요.";
+            if (projects == 0)
+                lblStatus.Text = TaskScanner.Diag.Length > 0 ? TaskScanner.Diag
+                    : "최근 30일 안의 Claude Code 세션을 찾지 못했어요. (" + Path.Combine(Fetcher.ConfigDir(), "projects") + ")";
             else
-                lblStatus.Text = "프로젝트 " + projects + "개 · 남은 할 일 " + total + "개 · " + DateTime.Now.ToString("HH:mm:ss") + " 갱신";
+                lblStatus.Text = "프로젝트 " + projects + "개 · 세션 " + sessionsShown + "개 · 남은 할 일 " + total + "개 · " + DateTime.Now.ToString("HH:mm:ss") + " 동기화";
         }
 
         TreeNode MakeTaskNode(TaskItem t, ProjectInfo p)
